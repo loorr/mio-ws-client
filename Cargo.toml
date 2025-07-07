@@ -1,0 +1,17 @@
+[package]
+name = "mio-ws"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+mio = { version = "1", features = ["net", 'os-poll'] }
+http = "1"
+anyhow = "1"
+byteorder = "1.5.0"
+native-tls = { version = "0.2", features = ["vendored"] }
+rustls = "0.23.28"
+webpki-roots = "1.0.1"
+crossbeam-channel = "0.5.15"
+bytes = "1"
+log = "0.4.8"
+tungstenite = "0.27.0"

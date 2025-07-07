@@ -1,6 +1,3 @@
-
-
-
 #[derive(Debug, PartialEq)]
 pub enum Opcode {
     ContinuationFrame = 0x0,

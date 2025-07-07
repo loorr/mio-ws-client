@@ -1,7 +1,7 @@
 use std::fmt;
 
-pub mod ws;
 pub mod protocol;
+pub mod ws;
 
 /// WebSocket message opcode as in RFC 6455.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -54,7 +54,8 @@ where
 
 impl fmt::Display for Control
 where
-    Self: Sized {
+    Self: Sized,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             Control::Close => write!(f, "CLOSE"),
@@ -65,8 +66,10 @@ where
     }
 }
 
-impl fmt::Display for OpCode where
-    Self: Sized {
+impl fmt::Display for OpCode
+where
+    Self: Sized,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self {
             OpCode::Data(d) => d.fmt(f),
@@ -115,24 +118,4 @@ impl From<u8> for OpCode {
             _ => panic!("Bug: OpCode out of range"),
         }
     }
-}
-
-
-
-/// A struct representing a WebSocket frame header.
-#[allow(missing_copy_implementations)]
-#[derive(Debug, Clone, Eq, PartialEq)]
-pub struct FrameHeader {
-    /// Indicates that the frame is the last one of a possibly fragmented message.
-    pub is_final: bool,
-    /// Reserved for protocol extensions.
-    pub rsv1: bool,
-    /// Reserved for protocol extensions.
-    pub rsv2: bool,
-    /// Reserved for protocol extensions.
-    pub rsv3: bool,
-    /// WebSocket protocol opcode.
-    pub opcode: OpCode,
-    /// A frame mask, if any.
-    pub mask: Option<[u8; 4]>,
 }
