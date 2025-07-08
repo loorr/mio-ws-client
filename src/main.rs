@@ -10,8 +10,9 @@ use std::cmp::PartialEq;
 use std::collections::HashMap;
 use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io, thread};
+use log::{debug, error, info, warn};
 use slab::Slab;
 use tungstenite::protocol::frame::FrameHeader;
 use webpki_roots::TLS_SERVER_ROOTS;
@@ -20,7 +21,10 @@ const CLIENT_TOKEN: Token = Token(0);
 const WAKER_TOKEN: Token = Token(usize::MAX - 1);
 
 fn main() {
-    println!("Hello, world!");
+    env_logger::Builder::new()
+        .filter_level(log::LevelFilter::Info)
+        .init();
+    info!("Starting websocket client");
 
     let tx = handshake_thread(1);
     for i in 0..10 {
@@ -120,7 +124,7 @@ where
             handshake_state: HandshakeState::Initial,
             host_info,
             header: None,
-            in_buffer: BytesMut::with_capacity(8192),
+            in_buffer: BytesMut::with_capacity(1024 * 1024 * 4),
             receive_callback: callback,
         }
     }
@@ -158,14 +162,18 @@ where
             match self.stream.read(&mut buf) {
                 Ok(n) => {
                     if n == 0 {
-                        println!("服务器关闭连接");
+                        error!("服务器关闭连接");
                         return Ok(());
                     }
                     self.in_buffer.extend_from_slice(&buf[..n]);
                 }
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) if e.kind() == io::ErrorKind::ConnectionReset || e.kind() == io::ErrorKind::BrokenPipe => {
+                    error!("连接被强制断开");
+                    return Err(e);
+                }
                 Err(e) => {
-                    eprintln!("读取数据时发生错误: {}", e);
+                    error!("读取数据时发生错误: {}", e);
                     return Err(e);
                 }
             };
@@ -174,35 +182,57 @@ where
     }
 
     fn encode_packets(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        // println!("{}", self.in_buffer.len());
-        while self.in_buffer.len() >= 2 {
-            // 读取 payload
-            let payload = loop {
-                {
-                    if self.header.is_none() {
-                        let mut cursor = Cursor::new(&mut self.in_buffer);
-                        self.header = FrameHeader::parse(&mut cursor)?;
+        loop {
+            // Step 1: 尝试解析帧头
+            if self.header.is_none() {
+                // 如果缓冲区数据太少，连解析头部的机会都没有，就直接返回等待更多数据
+                if self.in_buffer.len() < 2 {
+                    return Ok(());
+                }
+
+                let mut cursor = Cursor::new(&self.in_buffer);
+                match FrameHeader::parse(&mut cursor) {
+                    Ok(Some(header)) => {
+                        // 解析成功，记录头部，并消费掉已解析的数据
                         let advanced = cursor.position();
+                        self.header = Some(header);
                         bytes::Buf::advance(&mut self.in_buffer, advanced as _);
                     }
-
-                    if let Some((header, len)) = &self.header {
-                        let len = *len as usize;
-                        if len <= self.in_buffer.len() {
-                            self.header = None;
-                            break self.in_buffer.split_to(len);
-                        }
+                    Ok(None) => {
+                        // tungstenite::parse 返回 Ok(None) 表示数据不完整，无法解析出一个完整的头
+                        // 这不是错误，只是需要更多数据
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        // 这是真正的解析错误
+                        return Err(Box::new(e));
                     }
                 }
-                // Not enough data in buffer.
-                self.in_buffer.reserve(self.header.as_ref().map(|(_, l)| *l as usize).unwrap_or(6));
-            };
-            // 打印payload
-            let s = String::from_utf8_lossy(&payload);
-            (self.receive_callback)(s.to_string())
-        }
 
-        Ok(())
+                // Step 2: 检查是否有完整的帧 payload
+                if let Some((_header, len)) = &self.header {
+                    let payload_len = *len as usize;
+
+                    if self.in_buffer.len() >= payload_len {
+                        // 数据足够，提取 payload
+                        let payload = self.in_buffer.split_to(payload_len);
+
+                        // 重置 header，为解析下一帧做准备
+                        self.header = None;
+
+                        // 处理 payload
+                        let s = String::from_utf8_lossy(&payload);
+                        (self.receive_callback)(s.to_string());
+
+                        // 继续循环，尝试处理缓冲区中的下一个帧
+                        continue;
+                    } else {
+                        // 数据不足以构成一个完整的 payload，退出函数，等待下一次 read
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -225,7 +255,7 @@ fn decode_packets(buf: &mut BytesMut) {
 }
 
 fn handle_payload(payload: &[u8]) {
-    println!("Got message: {:?}", payload);
+    debug!("Got message: {:?}", payload);
 }
 
 fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
@@ -239,24 +269,40 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
         thread::Builder::new()
             .name(format!("work_{}_th", index).to_string())
             .spawn(move || -> io::Result<()> {
-                let mut events = Events::with_capacity(2048);
+                let mut events = Events::with_capacity(10);
                 let mut client_token_map = Slab::with_capacity(worker_num);
-                println!("工作线程开始: {}", index);
-                
+                info!("工作线程开始: {}", index);
+
+                let mut count = 0;
+                let mut start = Instant::now();
                 loop {
-                    poll.poll(&mut events, None)?;
+                    count += 1;
+                    if count % 10 == 0{
+                        info!("cost time: {:?} ms", start.elapsed().as_millis());
+                        start = Instant::now();
+                    }
+                    
+                    poll.poll(&mut events, Some(Duration::from_millis(1000)))?;
                     for event in events.iter() {
                         match event.token() {
                             WAKER_TOKEN => {
-                                while let Ok(mut ws_client) = rx.try_recv() {
-                                    println!(
-                                        "工作线程 {} 接收到客户端: {:?}",
-                                        index, ws_client.client_token
-                                    );
-                                    let entry = client_token_map.vacant_entry();
-                                    ws_client.client_token =Token(entry.key());
-                                    ws_client.register(&mut poll).unwrap();
-                                    entry.insert(ws_client);
+                                loop {
+                                    match rx.try_recv() {
+                                        Ok(mut ws_client) => { 
+                                                info!("工作线程 {} 接收到客户端: {:?}",
+                                                    index, ws_client.client_token
+                                                );
+                                                let entry = client_token_map.vacant_entry();
+                                                ws_client.client_token =Token(entry.key());
+                                                ws_client.register(&mut poll).unwrap();
+                                                entry.insert(ws_client);
+                                        }
+                                        Err(TryRecvError::Empty) => break,
+                                        Err(TryRecvError::Disconnected) => {
+                                            info!("工作线程 {} 收到断开信号，退出", index);
+                                            return Ok(());
+                                        }
+                                    }
                                 }
                             }
                             _ => {
@@ -269,8 +315,17 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 };
 
                                 if event.is_readable() {
-                                    client.read_all().unwrap();
-                                    client.encode_packets();
+                                    if let Err(e) = client.read_all() {
+                                        eprintln!("客户端读取失败，关闭连接: {:?}", e);
+                                        client_token_map.remove(event.token().0);
+                                        continue;
+                                    }
+
+                                    if let Err(e) = client.encode_packets() {
+                                        eprintln!("客户端解码失败，关闭连接: {:?}", e);
+                                        client_token_map.remove(event.token().0);
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -286,18 +341,20 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
     thread::Builder::new()
         .name("handshake_th".to_string())
         .spawn(move || -> std::io::Result<()> {
-            println!("握手线程开始");
+            debug!("握手线程开始");
+            
             let mut poll = Poll::new().unwrap();
             let mut events = Events::with_capacity(12);
             let mut client_token_map: HashMap<Token, WsClient<_>> = HashMap::new();
             let mut client_id = 0;
+            let mut next_worker = 0;
 
             loop {
                 match handshake_rx.try_recv() {
                     Ok(url) => {
-                        println!("url: {}", url);
+                        debug!("url: {}", url);
                         if let Some(host_info) = HostInfo::parse_url(&url) {
-                            println!("握手线程解析域名: {:?}", host_info);
+                            debug!("握手线程解析域名: {:?}", host_info);
                             let maybe_tls_stream = match host_info.protocol {
                                 protocol::WsProtocol::Wss => {
                                     let maybe_tls_stream = match tls_connect(&host_info) {
@@ -321,10 +378,9 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 }
                             };
                             client_id += 1;
-                            let mut ws_client =
-                                WsClient::new(Token(client_id), maybe_tls_stream, host_info, |s| println!("{}", s));
+                            let mut ws_client = WsClient::new(Token(client_id), maybe_tls_stream, host_info, |s| {});
 
-                            println!("握手线程注册客户端: {:?}", ws_client.client_token);
+                            debug!("握手线程注册客户端: {:?}", ws_client.client_token);
                             ws_client.register(&mut poll).unwrap();
                             client_token_map.insert(ws_client.client_token, ws_client);
                         } else {
@@ -335,16 +391,14 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                     Err(TryRecvError::Disconnected) => return Ok(()),
                     Err(TryRecvError::Empty) => {}
                 };
-
-                poll.poll(&mut events, Some(Duration::from_millis(100)))?;
+                let s = Instant::now();
+                poll.poll(&mut events, None)?;
                 for event in events.iter() {
                     if event.is_writable() {
                         if let Some(client) = client_token_map.get_mut(&event.token()) {
                             if client.handshake_state == HandshakeState::Initial {
-                                println!("发送握手请求");
                                 client.send_handshake()?;
                                 client.handshake_state = HandshakeState::WaitingForResponse;
-                                println!("发送握手请求done");
                             }
                         }
                     } else if event.is_readable() {
@@ -364,12 +418,12 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 };
                                 if n == 0 {
                                     println!("服务器关闭连接");
-                                    continue;
+                                    break;
                                 }
                                 client.in_buffer.extend_from_slice(&buf[..n]);
                             }
                             if client.in_buffer.len() == 0 {
-                                println!("没有读取到数据，继续等待");
+                                info!("没有读取到数据，继续等待");
                                 client_token_map.insert(client.client_token, client);
                                 continue;
                             }
@@ -389,50 +443,32 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 // 使用 from_utf8_lossy 检查握手响应
                                 let response_str = String::from_utf8_lossy(&handshake_data);
 
-                                println!("收到完整的握手响应: \n{}", response_str);
+                                // println!("收到完整的握手响应: \n{}", response_str);
                                 if response_str.contains("HTTP/1.1 101 Switching Protocols") {
                                     client.handshake_state = HandshakeState::Completed;
                                     client.deregister(&mut poll).unwrap();
 
-                                    println!("握手成功，WebSocket 连接已建立");
-                                    println!("缓冲区中剩余数据 {} 字节，将传递给工作线程", client.in_buffer.len());
+                                    info!("握手成功，WebSocket 连接已建立, 缓冲区中剩余数据 {} 字节，将传递给工作线程", client.in_buffer.len());
 
                                     // 现在 client 对象包含了 read_buf，里面是第一个WebSocket帧的数据
                                     // 直接将这个 client 发送给工作线程
-                                    worker_tx_vec[0].send(client).unwrap();
-                                    worker_wakers[0].wake().unwrap();
+                                    worker_tx_vec[next_worker].send(client).unwrap();
+                                    worker_wakers[next_worker].wake().unwrap();
+                                    next_worker = (next_worker + 1) % worker_tx_vec.len();
                                 } else {
-                                    println!("握手失败，响应内容：\n{}", response_str);
+                                    error!("握手失败，响应内容：\n{}", response_str);
                                     // 可以在这里关闭连接
                                 }
                             } else {
                                 // 没有找到边界，说明握手响应还没接收完
-                                println!("握手数据不完整，等待更多数据...");
+                                warn!("握手数据不完整，等待更多数据...");
                                 // 把 client 放回 map 中，等待下一次 readable 事件
                                 client_token_map.insert(client.client_token, client);
                             }
-
-                            //
-                            //
-                            //
-                            //
-                            // println!("payload size: {}", client.in_buffer.len());
-                            // let response = String::from_utf8_lossy(client.in_buffer.as_ref());
-                            // println!("收到服务器响应：\n{:?}", client.in_buffer);
-                            // if response.contains("HTTP/1.1 101 Switching Protocols") {
-                            //     client.handshake_state = HandshakeState::Completed;
-                            //     client.deregister(&mut poll).unwrap();
-                            //
-                            //     println!("握手成功，WebSocket 连接已建立");
-                            //     worker_tx_vec[0].send(client).unwrap();
-                            //     worker_wakers[0].wake().unwrap();
-                            // } else {
-                            //     println!("握手失败，响应内容：\n{}", response);
-                            //     return Ok(());
-                            // }
                         }
                     }
                 }
+                info!("event处理耗时: {:?}", s.elapsed().as_millis());
             }
         })
         .expect("Failed to spawn handshake thread");
@@ -519,7 +555,7 @@ fn tls_connect(host_info: &HostInfo) -> io::Result<StreamOwned<ClientConnection,
         poll.poll(&mut events, Some(Duration::from_millis(100)))?;
     }
 
-    println!("✅ TLS handshake completed with {:?}", host_info.domain);
+    debug!("✅ TLS handshake completed with {:?}", host_info.domain);
     // 取消register
     poll.registry().deregister(&mut socket)?;
     // 返回 TLS 流（可用于 WebSocket、HTTPS 等）

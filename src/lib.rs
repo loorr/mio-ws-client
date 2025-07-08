@@ -1,7 +1,6 @@
 use std::fmt;
 
 pub mod protocol;
-pub mod solt_map;
 
 /// WebSocket message opcode as in RFC 6455.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
