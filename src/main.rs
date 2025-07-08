@@ -12,6 +12,7 @@ use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use std::{io, thread};
+use slab::Slab;
 use tungstenite::protocol::frame::FrameHeader;
 use webpki_roots::TLS_SERVER_ROOTS;
 
@@ -22,7 +23,7 @@ fn main() {
     println!("Hello, world!");
 
     let tx = handshake_thread(1);
-    for i in 0..1000 {
+    for i in 0..10 {
         tx.send("wss://fstream.binance.com/ws/btcusdt@bookTicker".to_string())
             .unwrap();
         thread::sleep(Duration::from_secs(1));
@@ -198,35 +199,11 @@ where
             };
             // 打印payload
             let s = String::from_utf8_lossy(&payload);
-            // println!("{}", s);
             (self.receive_callback)(s.to_string())
         }
 
         Ok(())
     }
-}
-
-/// fn read_all(stream: &mut TcpStream, buffer: &mut BytesMut) -> io::Result<()> {
-#[warn(dead_code)]
-fn read_all(stream: &mut MaybeTlsStream, buffer: &mut BytesMut) -> io::Result<()> {
-    let mut buf = [0u8; 4096];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(n) => {
-                if n == 0 {
-                    println!("服务器关闭连接");
-                    return Ok(());
-                }
-                buffer.extend_from_slice(&buf[..n]);
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-            Err(e) => {
-                eprintln!("读取数据时发生错误: {}", e);
-                return Err(e);
-            }
-        };
-    }
-    Ok(())
 }
 
 fn decode_packets(buf: &mut BytesMut) {
@@ -263,43 +240,44 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
             .name(format!("work_{}_th", index).to_string())
             .spawn(move || -> io::Result<()> {
                 let mut events = Events::with_capacity(2048);
-                let mut client_token_map: HashMap<Token, WsClient<_>> = HashMap::new();
-
+                let mut client_token_map = Slab::with_capacity(worker_num);
                 println!("工作线程开始: {}", index);
-
+                
                 loop {
                     poll.poll(&mut events, None)?;
                     for event in events.iter() {
-                        if event.token() == WAKER_TOKEN {
-                            while let Ok(mut ws_client) = rx.try_recv() {
-                                println!(
-                                    "工作线程 {} 接收到客户端: {:?}",
-                                    index, ws_client.client_token
-                                );
-                                ws_client.register(&mut poll).unwrap();
-                                client_token_map.insert(ws_client.client_token, ws_client);
-                            }
-                        } else {
-                            let client = match client_token_map.get_mut(&event.token()) {
-                                Some(client) => client,
-                                None => {
-                                    eprintln!("未找到对应的客户端: {:?}", event.token());
-                                    continue;
+                        match event.token() {
+                            WAKER_TOKEN => {
+                                while let Ok(mut ws_client) = rx.try_recv() {
+                                    println!(
+                                        "工作线程 {} 接收到客户端: {:?}",
+                                        index, ws_client.client_token
+                                    );
+                                    let entry = client_token_map.vacant_entry();
+                                    ws_client.client_token =Token(entry.key());
+                                    ws_client.register(&mut poll).unwrap();
+                                    entry.insert(ws_client);
                                 }
-                            };
+                            }
+                            _ => {
+                                let client = match client_token_map.get_mut(event.token().0) {
+                                    Some(client) => client,
+                                    None => {
+                                        eprintln!("未找到对应的客户端: {:?}", event.token());
+                                        continue;
+                                    }
+                                };
 
-                            if event.is_readable() {
-                                client.read_all().unwrap();
-
-                                // 处理接收到的数据, 返回解码的数据
-                                let _ = client.encode_packets();
+                                if event.is_readable() {
+                                    client.read_all().unwrap();
+                                    client.encode_packets();
+                                }
                             }
                         }
                     }
                 }
             })
             .expect(format!("<UNK>: {}", worker_num).as_str());
-
         worker_tx_vec.push(tx);
         worker_wakers.push(waker);
     }
@@ -412,7 +390,6 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 let response_str = String::from_utf8_lossy(&handshake_data);
 
                                 println!("收到完整的握手响应: \n{}", response_str);
-
                                 if response_str.contains("HTTP/1.1 101 Switching Protocols") {
                                     client.handshake_state = HandshakeState::Completed;
                                     client.deregister(&mut poll).unwrap();
@@ -434,18 +411,18 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 // 把 client 放回 map 中，等待下一次 readable 事件
                                 client_token_map.insert(client.client_token, client);
                             }
-                            
-                            // 
-                            // 
-                            // 
-                            // 
+
+                            //
+                            //
+                            //
+                            //
                             // println!("payload size: {}", client.in_buffer.len());
                             // let response = String::from_utf8_lossy(client.in_buffer.as_ref());
                             // println!("收到服务器响应：\n{:?}", client.in_buffer);
                             // if response.contains("HTTP/1.1 101 Switching Protocols") {
                             //     client.handshake_state = HandshakeState::Completed;
                             //     client.deregister(&mut poll).unwrap();
-                            // 
+                            //
                             //     println!("握手成功，WebSocket 连接已建立");
                             //     worker_tx_vec[0].send(client).unwrap();
                             //     worker_wakers[0].wake().unwrap();
