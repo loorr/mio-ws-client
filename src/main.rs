@@ -12,10 +12,13 @@ use std::io::{Cursor, Read, Write};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{io, thread};
+use std::error::Error;
+use std::thread::sleep;
 use log::{debug, error, info, warn};
 use slab::Slab;
 use tungstenite::protocol::frame::FrameHeader;
 use webpki_roots::TLS_SERVER_ROOTS;
+use mio_ws::stream::MaybeTlsStream;
 
 const CLIENT_TOKEN: Token = Token(0);
 const WAKER_TOKEN: Token = Token(usize::MAX - 1);
@@ -27,7 +30,7 @@ fn main() {
     info!("Starting websocket client");
 
     let tx = handshake_thread(1);
-    for i in 0..10 {
+    for i in 0..100 {
         tx.send("wss://fstream.binance.com/ws/btcusdt@bookTicker".to_string())
             .unwrap();
         thread::sleep(Duration::from_secs(1));
@@ -50,49 +53,6 @@ enum HandshakeState {
     Completed,
     Failed
 }
-
-pub enum MaybeTlsStream {
-    Plain(TcpStream),
-    NativeTls(StreamOwned<ClientConnection, TcpStream>),
-}
-
-impl MaybeTlsStream {
-    fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
-        match self {
-            MaybeTlsStream::Plain(stream) => stream.write_all(buf),
-            MaybeTlsStream::NativeTls(stream) => stream.write_all(buf),
-        }
-    }
-
-    fn register(&mut self, token: Token, poll: &Poll) -> std::io::Result<()> {
-        let stream = match self {
-            MaybeTlsStream::Plain(stream) => stream,
-            MaybeTlsStream::NativeTls(stream) => &mut stream.sock,
-        };
-        poll.registry().register(
-            stream,
-            token,
-            Interest::WRITABLE | Interest::READABLE,
-        )
-    }
-
-    fn deregister(&mut self, poll: &Poll) -> io::Result<()> {
-        let stream = match self {
-            MaybeTlsStream::Plain(stream) => stream,
-            MaybeTlsStream::NativeTls(stream) => &mut stream.sock,
-        };
-        poll.registry().deregister(stream)
-    }
-
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            MaybeTlsStream::Plain(stream) => stream.read(buf),
-            MaybeTlsStream::NativeTls(stream) => stream.read(buf),
-        }
-    }
-}
-
-
 
 pub struct WsClient<Callback>
 where
@@ -181,13 +141,14 @@ where
         Ok(())
     }
 
-    fn encode_packets(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn encode_packets(&mut self) -> Result<u64, Box<dyn std::error::Error>> {
+        let mut count = 0;
         loop {
             // Step 1: 尝试解析帧头
             if self.header.is_none() {
                 // 如果缓冲区数据太少，连解析头部的机会都没有，就直接返回等待更多数据
                 if self.in_buffer.len() < 2 {
-                    return Ok(());
+                    return Ok(count);
                 }
 
                 let mut cursor = Cursor::new(&self.in_buffer);
@@ -201,7 +162,7 @@ where
                     Ok(None) => {
                         // tungstenite::parse 返回 Ok(None) 表示数据不完整，无法解析出一个完整的头
                         // 这不是错误，只是需要更多数据
-                        return Ok(());
+                        return Ok(count);
                     }
                     Err(e) => {
                         // 这是真正的解析错误
@@ -223,12 +184,13 @@ where
                         // 处理 payload
                         let s = String::from_utf8_lossy(&payload);
                         (self.receive_callback)(s.to_string());
+                        count += 1;
 
                         // 继续循环，尝试处理缓冲区中的下一个帧
                         continue;
                     } else {
                         // 数据不足以构成一个完整的 payload，退出函数，等待下一次 read
-                        return Ok(());
+                        return Ok(count);
                     }
                 }
             }
@@ -236,101 +198,103 @@ where
     }
 }
 
-fn decode_packets(buf: &mut BytesMut) {
-    loop {
-        if buf.len() < 2 {
-            break; // 不足以读长度字段
-        }
-
-        let len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-        if buf.len() < 2 + len {
-            break; // 不足以读完整 payload
-        }
-
-        buf.advance(2); // 丢掉长度字段
-        let payload = buf.split_to(len);
-
-        handle_payload(&payload);
-    }
-}
-
-fn handle_payload(payload: &[u8]) {
-    debug!("Got message: {:?}", payload);
-}
-
 fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
     let mut worker_tx_vec = Vec::with_capacity(worker_num);
     let mut worker_wakers = Vec::with_capacity(worker_num);
 
     for index in 0..worker_num {
-        let (tx, rx) = bounded::<WsClient<_>>(10);
+        let (tx, rx) = unbounded::<WsClient<_>>();
         let mut poll = Poll::new().unwrap();
         let waker = Waker::new(poll.registry(), WAKER_TOKEN).unwrap();
+        
         thread::Builder::new()
             .name(format!("work_{}_th", index).to_string())
             .spawn(move || -> io::Result<()> {
                 let mut events = Events::with_capacity(10);
-                let mut client_token_map = Slab::with_capacity(worker_num);
+                // let mut client_token_map = Slab::with_capacity(worker_num);
+                let mut client_token_map = HashMap::with_capacity(worker_num);
+                let mut next_token = 1;
                 info!("工作线程开始: {}", index);
 
+                let mut messages = 0;
                 let mut count = 0;
                 let mut start = Instant::now();
                 loop {
                     count += 1;
-                    if count % 10 == 0{
-                        info!("cost time: {:?} ms", start.elapsed().as_millis());
+                    if count % 100 == 0 {
+                        info!("cost time: {:?} ms, messages: {}", start.elapsed().as_millis(), messages);
                         start = Instant::now();
+                        messages = 0;
                     }
                     
-                    poll.poll(&mut events, Some(Duration::from_millis(1000)))?;
+                    poll.poll(&mut events, None)?;
                     for event in events.iter() {
                         match event.token() {
                             WAKER_TOKEN => {
-                                loop {
+                                info!("Waker received, 线程 {} 处理 Waker 事件", index);
+                                
+                                'inner: loop {
                                     match rx.try_recv() {
                                         Ok(mut ws_client) => { 
                                                 info!("工作线程 {} 接收到客户端: {:?}",
                                                     index, ws_client.client_token
                                                 );
-                                                let entry = client_token_map.vacant_entry();
-                                                ws_client.client_token =Token(entry.key());
+                                                // 为每个客户端分配一个唯一的 Tokenl
+                                                let token = Token(next_token);
+                                                next_token += 1;
+                                                ws_client.client_token = token;
                                                 ws_client.register(&mut poll).unwrap();
-                                                entry.insert(ws_client);
+                                                client_token_map.insert(token, ws_client);
+                                                // 这里可以选择将 ws_client 直接发送到工作线程
+                                                info!("工作线程 {} 处理完到客户端: {:?}",
+                                                    index, token
+                                                );
+                                            
+                                                    
+                                                // let entry = client_token_map.vacant_entry();
+                                                // ws_client.client_token =Token(entry.key());
+                                                // ws_client.register(&mut poll).unwrap();
+                                                // entry.insert(ws_client);
                                         }
-                                        Err(TryRecvError::Empty) => break,
+                                        Err(TryRecvError::Empty) => break 'inner,
                                         Err(TryRecvError::Disconnected) => {
-                                            info!("工作线程 {} 收到断开信号，退出", index);
+                                            error!("工作线程 {} 收到断开信号，退出", index);
                                             return Ok(());
                                         }
                                     }
                                 }
+                                info!("Waker received, 线程 {} 处理完 Waker 事件", index);
                             }
                             _ => {
-                                let client = match client_token_map.get_mut(event.token().0) {
+                                let client = match client_token_map.get_mut(&event.token()) {
                                     Some(client) => client,
                                     None => {
-                                        eprintln!("未找到对应的客户端: {:?}", event.token());
+                                        error!("未找到对应的客户端: {:?}", event.token());
                                         continue;
                                     }
                                 };
 
                                 if event.is_readable() {
                                     if let Err(e) = client.read_all() {
-                                        eprintln!("客户端读取失败，关闭连接: {:?}", e);
-                                        client_token_map.remove(event.token().0);
+                                        error!("客户端读取失败，关闭连接: {:?}", e);
+                                        client_token_map.remove(&event.token());
                                         continue;
                                     }
 
-                                    if let Err(e) = client.encode_packets() {
-                                        eprintln!("客户端解码失败，关闭连接: {:?}", e);
-                                        client_token_map.remove(event.token().0);
-                                        continue;
+                                    match client.encode_packets() {
+                                        Ok(n) => {
+                                            messages +=n;
+                                        }
+                                        Err(err) => {
+                                            error!("encode error: {:?}", err);
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                info!("工作线程 {} 结束", index);
             })
             .expect(format!("<UNK>: {}", worker_num).as_str());
         worker_tx_vec.push(tx);
@@ -378,7 +342,9 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                 }
                             };
                             client_id += 1;
-                            let mut ws_client = WsClient::new(Token(client_id), maybe_tls_stream, host_info, |s| {});
+                            let mut ws_client = WsClient::new(Token(client_id), maybe_tls_stream, host_info, |s| {
+                                    // info!("收到消息: {}", s)
+                            });
 
                             debug!("握手线程注册客户端: {:?}", ws_client.client_token);
                             ws_client.register(&mut poll).unwrap();
@@ -453,6 +419,7 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                                     // 现在 client 对象包含了 read_buf，里面是第一个WebSocket帧的数据
                                     // 直接将这个 client 发送给工作线程
                                     worker_tx_vec[next_worker].send(client).unwrap();
+                                    sleep(Duration::from_millis(100));
                                     worker_wakers[next_worker].wake().unwrap();
                                     next_worker = (next_worker + 1) % worker_tx_vec.len();
                                 } else {
@@ -468,7 +435,7 @@ fn handshake_thread(worker_num: usize) -> crossbeam_channel::Sender<String> {
                         }
                     }
                 }
-                info!("event处理耗时: {:?}", s.elapsed().as_millis());
+                // info!("event处理耗时: {:?}", s.elapsed().as_millis());
             }
         })
         .expect("Failed to spawn handshake thread");
